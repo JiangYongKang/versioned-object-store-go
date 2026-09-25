@@ -1,0 +1,7 @@
+{
+  "root_dir": "./.vos-data",
+  "min_part_size": 5242880,
+  "max_parts": 10000,
+  "gc_interval": 60000000000,
+  "gc_unref_age": 30000000000
+}
