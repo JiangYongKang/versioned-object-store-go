@@ -2,6 +2,7 @@ package objectstore
 
 import (
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,8 @@ type versionMeta struct {
 	Size      int64     `json:"size"`
 	Deleted   bool      `json:"deleted"`
 	CreatedAt time.Time `json:"createdAt"`
+	// SHA256 为数据内容的十六进制校验和；旧格式数据可能为空，打开校验时跳过。
+	SHA256 string `json:"sha256,omitempty"`
 }
 
 // objectMeta 是一个键的全部版本，按创建顺序排列。
@@ -62,17 +65,25 @@ type Store struct {
 	cfg    Config
 	log    *slog.Logger
 	m      *meta
+	lock   *dirLock
 	closed bool
 }
 
 // Open 打开（必要时创建）位于 cfg.Dir 的存储，并执行崩溃恢复：
-// 丢弃未提交完的元数据临时文件，清除无元数据引用的数据文件与上传目录，
-// 保证重启后不存在悬挂条目。
+// 先获取目录独占锁（已被占用时返回 *LockError），
+// 再区分可安全丢弃的崩溃残留（自动清除）与真正的数据损坏（打开失败，
+// 返回 *CorruptionError 且不改动任何磁盘状态）。
 func Open(cfg Config) (*Store, error) {
 	cfg.withDefaults()
-	s := &Store{cfg: cfg, log: cfg.Logger}
+	lk, err := acquireDirLock(cfg.Dir)
+	if err != nil {
+		cfg.Logger.Info("open rejected: directory locked", "dir", cfg.Dir, "err", err)
+		return nil, err
+	}
+	s := &Store{cfg: cfg, log: cfg.Logger, lock: lk}
 	for _, d := range []string{cfg.Dir, s.dataDir(), s.uploadsDir()} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
+			lk.release()
 			return nil, err
 		}
 	}
@@ -83,9 +94,11 @@ func Open(cfg Config) (*Store, error) {
 	m := &meta{NextVersion: 1, Objects: map[string]*objectMeta{}, Uploads: map[string]*uploadMeta{}}
 	if b, err := os.ReadFile(s.metaPath()); err == nil {
 		if err := json.Unmarshal(b, m); err != nil {
-			return nil, fmt.Errorf("objectstore: corrupt meta.json: %w", err)
+			lk.release()
+			return nil, &CorruptionError{Dir: cfg.Dir, Detail: "meta.json is not valid JSON: " + err.Error()}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
+		lk.release()
 		return nil, err
 	}
 	if m.Objects == nil {
@@ -99,17 +112,22 @@ func Open(cfg Config) (*Store, error) {
 	}
 	s.m = m
 	if err := s.recoverLocked(); err != nil {
+		lk.release()
 		return nil, err
 	}
 	s.log.Info("store opened", "dir", cfg.Dir, "objects", len(m.Objects), "uploads", len(m.Uploads))
 	return s, nil
 }
 
-// Close 关闭存储，后续调用返回错误。
+// Close 关闭存储并释放目录独占锁，后续调用返回错误。
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
 	s.closed = true
+	s.lock.release()
 	return nil
 }
 
@@ -150,38 +168,39 @@ func (s *Store) persistLocked() error {
 	return os.Rename(tmp, s.metaPath())
 }
 
-// writeDataLocked 将 r 的内容先写入临时文件再原子就位，返回字节数。
+// writeDataLocked 将 r 的内容先写入临时文件再原子就位，返回字节数与内容校验和。
 // 调用方必须已持有锁；就位失败时清理临时文件。
-func (s *Store) writeDataLocked(key, versionID string, r io.Reader) (int64, error) {
+func (s *Store) writeDataLocked(key, versionID string, r io.Reader) (int64, string, error) {
 	dir := s.keyDir(key)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	tmp := filepath.Join(dir, ".tmp-"+versionID)
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
-	n, err := io.Copy(f, r)
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(f, h), r)
 	if err != nil {
 		f.Close()
 		os.Remove(tmp)
-		return 0, err
+		return 0, "", err
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
 		os.Remove(tmp)
-		return 0, err
+		return 0, "", err
 	}
 	if err := f.Close(); err != nil {
 		os.Remove(tmp)
-		return 0, err
+		return 0, "", err
 	}
 	if err := os.Rename(tmp, s.dataPath(key, versionID)); err != nil {
 		os.Remove(tmp)
-		return 0, err
+		return 0, "", err
 	}
-	return n, nil
+	return n, hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // checkPreconditionsLocked 校验条件写入前置条件，失败时返回可区分原因的 *PreconditionError。
@@ -236,11 +255,11 @@ func (s *Store) Put(key string, r io.Reader, opts PutOptions) (VersionInfo, erro
 		return VersionInfo{}, err
 	}
 	vid := s.nextVersionIDLocked()
-	size, err := s.writeDataLocked(key, vid, r)
+	size, sum, err := s.writeDataLocked(key, vid, r)
 	if err != nil {
 		return VersionInfo{}, err
 	}
-	vm := &versionMeta{VersionID: vid, Size: size, CreatedAt: time.Now()}
+	vm := &versionMeta{VersionID: vid, Size: size, CreatedAt: time.Now(), SHA256: sum}
 	s.commitVersionLocked(key, vm)
 	if err := s.persistLocked(); err != nil {
 		return VersionInfo{}, err
@@ -350,27 +369,32 @@ func (s *Store) ListVersions(key string) ([]VersionInfo, error) {
 	return out, nil
 }
 
-// recoverLocked 崩溃恢复：清除无元数据引用的数据文件与上传残留，
-// 保证不存在引用了缺失数据或无对应元数据的悬挂条目。
+// recoverLocked 崩溃恢复，分两类情况：
+//  1. 真正的数据损坏：元数据仍引用的版本其数据缺失、大小或校验和不一致。
+//     此时返回 *CorruptionError，Open 失败且不改动任何磁盘状态，
+//     重复打开结论一致，绝不静默抹掉有问题的版本。
+//  2. 可安全丢弃的崩溃残留：未被元数据引用的数据文件/临时文件、
+//     已终结或未知的上传目录、未登记的分片文件。自动清除后继续启动。
 func (s *Store) recoverLocked() error {
-	// 1. 元数据引用的数据文件必须存在；缺失则移除该版本条目（防御，正常不应发生）。
+	// 1. 校验所有仍被元数据引用的版本，收集损坏项。
+	var corrupt []CorruptVersion
 	referenced := map[string]bool{}
 	for key, obj := range s.m.Objects {
-		kept := obj.Versions[:0]
 		for _, vm := range obj.Versions {
 			if vm.Deleted {
-				kept = append(kept, vm)
 				continue
 			}
 			p := s.dataPath(key, vm.VersionID)
-			if _, err := os.Stat(p); err != nil {
-				s.log.Warn("recovery: dropping version with missing data", "key", key, "version", vm.VersionID)
-				continue
-			}
 			referenced[p] = true
-			kept = append(kept, vm)
+			if reason := s.verifyVersionData(p, vm); reason != "" {
+				s.log.Warn("recovery: corrupt version detected", "key", key, "version", vm.VersionID, "reason", reason)
+				corrupt = append(corrupt, CorruptVersion{Key: key, VersionID: vm.VersionID, Reason: reason})
+			}
 		}
-		obj.Versions = kept
+	}
+	if len(corrupt) > 0 {
+		// 不清理、不持久化：保持现场，重复打开结论一致。
+		return &CorruptionError{Dir: s.cfg.Dir, Versions: corrupt}
 	}
 	// 2. 删除无元数据引用的数据文件（含崩溃残留的临时文件）。
 	err := filepath.Walk(s.dataDir(), func(path string, info os.FileInfo, err error) error {
@@ -391,4 +415,34 @@ func (s *Store) recoverLocked() error {
 		return err
 	}
 	return s.persistLocked()
+}
+
+// verifyVersionData 校验数据文件与版本记录是否一致；一致返回空串，否则返回原因。
+func (s *Store) verifyVersionData(path string, vm *versionMeta) string {
+	fi, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "data file missing"
+		}
+		return "data file unreadable: " + err.Error()
+	}
+	if fi.Size() != vm.Size {
+		return fmt.Sprintf("size mismatch: record=%d actual=%d", vm.Size, fi.Size())
+	}
+	if vm.SHA256 == "" {
+		return "" // 旧格式无校验和，仅校验存在性与大小。
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "data file unreadable: " + err.Error()
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "data file unreadable: " + err.Error()
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != vm.SHA256 {
+		return fmt.Sprintf("checksum mismatch: record=%s actual=%s", vm.SHA256, got)
+	}
+	return ""
 }

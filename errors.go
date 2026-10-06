@@ -30,6 +30,52 @@ func (e *PreconditionError) Is(target error) bool {
 	return target == ErrPreconditionFailed
 }
 
+// LockError 表示数据目录已被其他使用者独占打开。
+// Holder 尽量给出当前持有者的信息（来自目录内 LOCK 文件），便于定位占用方。
+type LockError struct {
+	Dir    string
+	Holder string
+}
+
+func (e *LockError) Error() string {
+	if e.Holder == "" {
+		return "objectstore: directory " + e.Dir + " is exclusively locked by another process"
+	}
+	return "objectstore: directory " + e.Dir + " is exclusively locked by another process: " + e.Holder
+}
+
+// Is 支持 errors.Is(err, ErrDirLocked)。
+func (e *LockError) Is(target error) bool { return target == ErrDirLocked }
+
+// CorruptVersion 描述一个被判定为损坏的版本。
+type CorruptVersion struct {
+	Key       string
+	VersionID string
+	Reason    string
+}
+
+// CorruptionError 表示打开时发现真正的数据损坏（区别于可安全丢弃的崩溃残留）。
+// 此时 Open 失败且不修改任何磁盘状态，重复打开结论一致。
+type CorruptionError struct {
+	Dir      string
+	Versions []CorruptVersion // 元数据引用但数据缺失/不一致的版本
+	Detail   string           // 其他损坏（如 meta.json 无法解析）的描述
+}
+
+func (e *CorruptionError) Error() string {
+	msg := "objectstore: corruption detected in " + e.Dir
+	if e.Detail != "" {
+		msg += ": " + e.Detail
+	}
+	for _, v := range e.Versions {
+		msg += "; key=" + v.Key + " version=" + v.VersionID + ": " + v.Reason
+	}
+	return msg
+}
+
+// Is 支持 errors.Is(err, ErrCorruption)。
+func (e *CorruptionError) Is(target error) bool { return target == ErrCorruption }
+
 var (
 	// ErrPreconditionFailed 前置条件不成立（可用 errors.As 取 *PreconditionError 区分原因）。
 	ErrPreconditionFailed = errors.New("objectstore: precondition failed")
@@ -49,4 +95,8 @@ var (
 	ErrPartMissing = errors.New("objectstore: required part missing")
 	// ErrNotImplemented 骨架占位。
 	ErrNotImplemented = errors.New("objectstore: not implemented")
+	// ErrDirLocked 数据目录已被其他使用者独占打开（可用 errors.As 取 *LockError 看持有者）。
+	ErrDirLocked = errors.New("objectstore: directory locked")
+	// ErrCorruption 打开时发现真正的数据损坏（可用 errors.As 取 *CorruptionError 定位键与版本）。
+	ErrCorruption = errors.New("objectstore: corruption detected")
 )

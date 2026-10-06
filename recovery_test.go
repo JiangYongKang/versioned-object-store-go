@@ -117,8 +117,10 @@ func TestRecoveryRemovesCrashResidue(t *testing.T) {
 	}
 }
 
-// 元数据引用了缺失数据文件时，恢复须移除该悬挂版本条目而非留下坏引用。
-func TestRecoveryDropsVersionWithMissingData(t *testing.T) {
+// 元数据引用了缺失数据文件时属于真正的数据损坏：Open 必须失败并给出
+// 可区分的 *CorruptionError，指出是哪个键、哪个版本；不得静默抹掉该版本，
+// 且反复打开结论一致、磁盘现场不被改动。
+func TestRecoveryFailsOnVersionWithMissingData(t *testing.T) {
 	dir := t.TempDir()
 	s := reopen(t, dir)
 	v1 := putString(t, s, "k", "v1", PutOptions{})
@@ -132,20 +134,28 @@ func TestRecoveryDropsVersionWithMissingData(t *testing.T) {
 	if err := os.Remove(matches[0]); err != nil {
 		t.Fatalf("remove data file: %v", err)
 	}
-	s = reopen(t, dir)
-	vs, err := s.ListVersions("k")
-	if err != nil {
-		t.Fatalf("list: %v", err)
+	// 反复打开：每次都必须以相同的损坏结论失败。
+	for attempt := 1; attempt <= 3; attempt++ {
+		_, err := Open(Config{Dir: dir, Logger: slog.New(slog.NewTextHandler(os.Stderr, nil))})
+		var ce *CorruptionError
+		if !errors.As(err, &ce) {
+			t.Fatalf("attempt %d: open err = %v, want *CorruptionError", attempt, err)
+		}
+		if !errors.Is(err, ErrCorruption) {
+			t.Fatalf("attempt %d: err should match ErrCorruption", attempt)
+		}
+		if len(ce.Versions) != 1 || ce.Versions[0].Key != "k" || ce.Versions[0].VersionID != v1.VersionID {
+			t.Fatalf("attempt %d: corrupt versions = %+v, want k/%s", attempt, ce.Versions, v1.VersionID)
+		}
+		t.Logf("attempt %d: corruption reported as: %v", attempt, err)
 	}
-	if len(vs) != 1 || vs[0].VersionID != v2.VersionID {
-		t.Fatalf("versions = %+v, want only %s", vs, v2.VersionID)
+	// 现场未被改动：丢失版本的记录仍在，未损坏版本的数据仍在。
+	if _, err := os.Stat(filepath.Join(dir, "meta.json")); err != nil {
+		t.Fatalf("meta.json should be untouched: %v", err)
 	}
-	r, _, err := s.Get("k")
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	if got := getString(t, r); got != "v2" {
-		t.Fatalf("content = %q, want %q", got, "v2")
+	matches, _ = filepath.Glob(filepath.Join(dir, "data", "*", v2.VersionID))
+	if len(matches) != 1 {
+		t.Fatalf("healthy version %s data should be untouched", v2.VersionID)
 	}
 }
 

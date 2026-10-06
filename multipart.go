@@ -2,6 +2,7 @@ package objectstore
 
 import (
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -171,6 +172,8 @@ func (s *Store) CompleteUpload(uploadID string, parts []int) (VersionInfo, error
 	if err != nil {
 		return VersionInfo{}, err
 	}
+	h := sha256.New()
+	w := io.MultiWriter(out, h)
 	var size int64
 	for _, n := range parts {
 		pf, err := os.Open(s.partPath(uploadID, n))
@@ -179,9 +182,9 @@ func (s *Store) CompleteUpload(uploadID string, parts []int) (VersionInfo, error
 			os.Remove(tmp)
 			return VersionInfo{}, err
 		}
-		w, err := io.Copy(out, pf)
+		written, err := io.Copy(w, pf)
 		pf.Close()
-		size += w
+		size += written
 		if err != nil {
 			out.Close()
 			os.Remove(tmp)
@@ -201,7 +204,7 @@ func (s *Store) CompleteUpload(uploadID string, parts []int) (VersionInfo, error
 		os.Remove(tmp)
 		return VersionInfo{}, err
 	}
-	vm := &versionMeta{VersionID: vid, Size: size, CreatedAt: time.Now()}
+	vm := &versionMeta{VersionID: vid, Size: size, CreatedAt: time.Now(), SHA256: hex.EncodeToString(h.Sum(nil))}
 	s.commitVersionLocked(um.Key, vm)
 	um.State = UploadCompleted
 	um.ResultVersion = vid
