@@ -1,6 +1,9 @@
 package objectstore
 
-import "errors"
+import (
+	"errors"
+	"strconv"
+)
 
 // PreconditionKind 区分条件写入失败的具体原因。
 type PreconditionKind string
@@ -49,4 +52,58 @@ var (
 	ErrPartMissing = errors.New("objectstore: required part missing")
 	// ErrNotImplemented 骨架占位。
 	ErrNotImplemented = errors.New("objectstore: not implemented")
+	// ErrDirLocked 数据目录已被其他使用者独占打开。
+	ErrDirLocked = errors.New("objectstore: directory is locked by another opener")
+	// ErrCorruption 打开时发现真正的数据损坏（区别于可安全丢弃的崩溃残留）。
+	ErrCorruption = errors.New("objectstore: data corruption detected")
 )
+
+// DirLockedError 表示打开被拒绝：目录已被其他使用者独占持有。
+type DirLockedError struct {
+	Dir string
+	// HolderPID 为锁文件中记录的持有方进程号（不可用时为 0）。
+	HolderPID int
+}
+
+func (e *DirLockedError) Error() string {
+	if e.HolderPID > 0 {
+		return "objectstore: directory " + e.Dir + " is exclusively opened by pid " +
+			strconv.Itoa(e.HolderPID)
+	}
+	return "objectstore: directory " + e.Dir + " is exclusively opened by another process"
+}
+
+// Is 支持 errors.Is(err, ErrDirLocked)。
+func (e *DirLockedError) Is(target error) bool { return target == ErrDirLocked }
+
+// CorruptVersion 指出一个损坏的版本及其原因。
+type CorruptVersion struct {
+	Key       string
+	VersionID string
+	Reason    string
+}
+
+// CorruptionError 表示打开时发现不可自动修复的数据损坏。
+// 与崩溃残留（无引用文件、未提交临时文件）不同，此类问题必须显式报错，
+// 不得静默抹除有问题的版本。
+type CorruptionError struct {
+	// Meta 非空表示元数据文件本身损坏（截断/非法内容）。
+	Meta error
+	// Versions 列出元数据完好但数据缺失/不一致的版本。
+	Versions []CorruptVersion
+}
+
+func (e *CorruptionError) Error() string {
+	if e.Meta != nil {
+		return "objectstore: corrupt meta.json: " + e.Meta.Error()
+	}
+	msg := "objectstore: corrupted versions:"
+	for _, v := range e.Versions {
+		msg += " [" + v.Key + "@" + v.VersionID + ": " + v.Reason + "]"
+	}
+	return msg
+}
+
+// Is 支持 errors.Is(err, ErrCorruption)。
+func (e *CorruptionError) Is(target error) bool { return target == ErrCorruption }
+

@@ -2,6 +2,7 @@ package objectstore
 
 import (
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,9 @@ type versionMeta struct {
 	Size      int64     `json:"size"`
 	Deleted   bool      `json:"deleted"`
 	CreatedAt time.Time `json:"createdAt"`
+	// SHA256 为数据内容校验和（十六进制），用于打开时区分可丢弃残留与真实损坏。
+	// 旧版本存储的元数据可能缺省该字段，此时打开只做尺寸校验（兼容范围见 README）。
+	SHA256 string `json:"sha256,omitempty"`
 }
 
 // objectMeta 是一个键的全部版本，按创建顺序排列。
@@ -62,31 +66,54 @@ type Store struct {
 	cfg    Config
 	log    *slog.Logger
 	m      *meta
+	lock   *dirLock
 	closed bool
+	// activeReads 记录正在读取中的数据文件引用计数（按路径），
+	// 保留回收据此暂缓删除被读取中的版本数据。
+	activeReads map[string]int
 }
 
 // Open 打开（必要时创建）位于 cfg.Dir 的存储，并执行崩溃恢复：
 // 丢弃未提交完的元数据临时文件，清除无元数据引用的数据文件与上传目录，
 // 保证重启后不存在悬挂条目。
+//
+// 目录独占：同一目录同一时刻只能被一个 Open 成功打开（含跨进程），
+// 其他使用者获得 *DirLockedError（可用 errors.Is(err, ErrDirLocked) 判定），
+// 且不会对目录内任何数据做修改；持有者 Close 或进程退出后锁自动释放。
 func Open(cfg Config) (*Store, error) {
 	cfg.withDefaults()
-	s := &Store{cfg: cfg, log: cfg.Logger}
+	// 先取目录独占锁：被拒绝的一方不得触碰目录内任何数据（含恢复清理）。
+	lock, err := acquireDirLock(cfg.Dir)
+	if err != nil {
+		return nil, err
+	}
+	s := &Store{cfg: cfg, log: cfg.Logger, lock: lock, activeReads: map[string]int{}}
+	if err := s.openLocked(); err != nil {
+		lock.release()
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *Store) openLocked() error {
+	cfg := s.cfg
 	for _, d := range []string{cfg.Dir, s.dataDir(), s.uploadsDir()} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	// 丢弃崩溃残留的未提交元数据临时文件。
 	if err := os.Remove(s.metaPath() + ".tmp"); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
+		return err
 	}
 	m := &meta{NextVersion: 1, Objects: map[string]*objectMeta{}, Uploads: map[string]*uploadMeta{}}
 	if b, err := os.ReadFile(s.metaPath()); err == nil {
 		if err := json.Unmarshal(b, m); err != nil {
-			return nil, fmt.Errorf("objectstore: corrupt meta.json: %w", err)
+			// 元数据本身损坏（截断/非法内容）：不可自动修复，明确报错。
+			return &CorruptionError{Meta: err}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, err
+		return err
 	}
 	if m.Objects == nil {
 		m.Objects = map[string]*objectMeta{}
@@ -99,18 +126,21 @@ func Open(cfg Config) (*Store, error) {
 	}
 	s.m = m
 	if err := s.recoverLocked(); err != nil {
-		return nil, err
+		return err
 	}
 	s.log.Info("store opened", "dir", cfg.Dir, "objects", len(m.Objects), "uploads", len(m.Uploads))
-	return s, nil
+	return nil
 }
 
-// Close 关闭存储，后续调用返回错误。
+// Close 关闭存储并释放目录独占锁，后续调用返回错误。
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
 	s.closed = true
-	return nil
+	return s.lock.release()
 }
 
 func (s *Store) metaPath() string { return filepath.Join(s.cfg.Dir, "meta.json") }
@@ -150,38 +180,39 @@ func (s *Store) persistLocked() error {
 	return os.Rename(tmp, s.metaPath())
 }
 
-// writeDataLocked 将 r 的内容先写入临时文件再原子就位，返回字节数。
+// writeDataLocked 将 r 的内容先写入临时文件再原子就位，返回字节数与内容校验和。
 // 调用方必须已持有锁；就位失败时清理临时文件。
-func (s *Store) writeDataLocked(key, versionID string, r io.Reader) (int64, error) {
+func (s *Store) writeDataLocked(key, versionID string, r io.Reader) (int64, string, error) {
 	dir := s.keyDir(key)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	tmp := filepath.Join(dir, ".tmp-"+versionID)
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
-	n, err := io.Copy(f, r)
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(f, h), r)
 	if err != nil {
 		f.Close()
 		os.Remove(tmp)
-		return 0, err
+		return 0, "", err
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
 		os.Remove(tmp)
-		return 0, err
+		return 0, "", err
 	}
 	if err := f.Close(); err != nil {
 		os.Remove(tmp)
-		return 0, err
+		return 0, "", err
 	}
 	if err := os.Rename(tmp, s.dataPath(key, versionID)); err != nil {
 		os.Remove(tmp)
-		return 0, err
+		return 0, "", err
 	}
-	return n, nil
+	return n, hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // checkPreconditionsLocked 校验条件写入前置条件，失败时返回可区分原因的 *PreconditionError。
@@ -236,11 +267,11 @@ func (s *Store) Put(key string, r io.Reader, opts PutOptions) (VersionInfo, erro
 		return VersionInfo{}, err
 	}
 	vid := s.nextVersionIDLocked()
-	size, err := s.writeDataLocked(key, vid, r)
+	size, sum, err := s.writeDataLocked(key, vid, r)
 	if err != nil {
 		return VersionInfo{}, err
 	}
-	vm := &versionMeta{VersionID: vid, Size: size, CreatedAt: time.Now()}
+	vm := &versionMeta{VersionID: vid, Size: size, CreatedAt: time.Now(), SHA256: sum}
 	s.commitVersionLocked(key, vm)
 	if err := s.persistLocked(); err != nil {
 		return VersionInfo{}, err
@@ -296,13 +327,40 @@ func (s *Store) GetVersion(key, versionID string) (io.ReadCloser, VersionInfo, e
 }
 
 func (s *Store) openVersionLocked(key string, vm *versionMeta) (io.ReadCloser, VersionInfo, error) {
-	f, err := os.Open(s.dataPath(key, vm.VersionID))
+	p := s.dataPath(key, vm.VersionID)
+	f, err := os.Open(p)
 	if err != nil {
 		// 元数据引用了缺失数据：恢复流程应已杜绝，此处防御性报错。
 		return nil, VersionInfo{}, fmt.Errorf("objectstore: data file missing for key %s version %s: %w", key, vm.VersionID, err)
 	}
+	// 登记在读引用：保留回收不得删除读取中的版本数据。
+	s.activeReads[p]++
 	s.log.Info("get version", "key", key, "version", vm.VersionID, "size", vm.Size)
-	return f, VersionInfo{Key: key, VersionID: vm.VersionID, Size: vm.Size, CreatedAt: vm.CreatedAt}, nil
+	return &trackedReadCloser{f: f, s: s, path: p}, VersionInfo{Key: key, VersionID: vm.VersionID, Size: vm.Size, CreatedAt: vm.CreatedAt}, nil
+}
+
+// trackedReadCloser 在关闭时释放数据文件的在读引用计数。
+type trackedReadCloser struct {
+	f    *os.File
+	s    *Store
+	path string
+	once sync.Once
+}
+
+func (t *trackedReadCloser) Read(b []byte) (int, error) { return t.f.Read(b) }
+
+func (t *trackedReadCloser) Close() error {
+	err := t.f.Close()
+	t.once.Do(func() {
+		t.s.mu.Lock()
+		defer t.s.mu.Unlock()
+		if n := t.s.activeReads[t.path] - 1; n <= 0 {
+			delete(t.s.activeReads, t.path)
+		} else {
+			t.s.activeReads[t.path] = n
+		}
+	})
+	return err
 }
 
 type emptyReader struct{}
@@ -350,27 +408,38 @@ func (s *Store) ListVersions(key string) ([]VersionInfo, error) {
 	return out, nil
 }
 
-// recoverLocked 崩溃恢复：清除无元数据引用的数据文件与上传残留，
-// 保证不存在引用了缺失数据或无对应元数据的悬挂条目。
+// recoverLocked 崩溃恢复，区分两类情形：
+//
+//  1. 可安全丢弃的崩溃残留（自动修复）：无元数据引用的数据文件、
+//     未提交的临时文件、已终结/未知上传会话的目录、initiated 会话中未登记的分片。
+//     这些残留源于"数据先落盘、元数据后提交"的写入顺序，丢弃不影响任何可见版本。
+//  2. 真正的数据损坏（打开失败）：元数据引用的版本其数据文件缺失、
+//     尺寸不符或内容校验和不匹配。此类问题返回 *CorruptionError 并逐个指出
+//     键与版本，绝不静默抹除版本或让读取回退到更旧版本。
+//
+// 修复后的状态自洽：同样的目录反复重启，恢复结论保持一致。
 func (s *Store) recoverLocked() error {
-	// 1. 元数据引用的数据文件必须存在；缺失则移除该版本条目（防御，正常不应发生）。
+	// 1. 校验元数据引用的每个版本数据完整；任何缺失/不一致都视为真实损坏。
 	referenced := map[string]bool{}
+	var corrupt []CorruptVersion
 	for key, obj := range s.m.Objects {
-		kept := obj.Versions[:0]
 		for _, vm := range obj.Versions {
 			if vm.Deleted {
-				kept = append(kept, vm)
 				continue
 			}
 			p := s.dataPath(key, vm.VersionID)
-			if _, err := os.Stat(p); err != nil {
-				s.log.Warn("recovery: dropping version with missing data", "key", key, "version", vm.VersionID)
+			if reason := s.verifyVersionData(p, vm); reason != "" {
+				s.log.Error("recovery: corrupted version detected",
+					"key", key, "version", vm.VersionID, "reason", reason)
+				corrupt = append(corrupt, CorruptVersion{Key: key, VersionID: vm.VersionID, Reason: reason})
 				continue
 			}
 			referenced[p] = true
-			kept = append(kept, vm)
 		}
-		obj.Versions = kept
+	}
+	if len(corrupt) > 0 {
+		// 损坏时打开失败：不做任何清理，保持现场可反复重开且结论一致。
+		return &CorruptionError{Versions: corrupt}
 	}
 	// 2. 删除无元数据引用的数据文件（含崩溃残留的临时文件）。
 	err := filepath.Walk(s.dataDir(), func(path string, info os.FileInfo, err error) error {
@@ -391,4 +460,32 @@ func (s *Store) recoverLocked() error {
 		return err
 	}
 	return s.persistLocked()
+}
+
+// verifyVersionData 校验版本数据文件，返回空串表示完好，否则返回损坏原因。
+func (s *Store) verifyVersionData(path string, vm *versionMeta) string {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return "data file missing: " + err.Error()
+	}
+	if fi.Size() != vm.Size {
+		return fmt.Sprintf("size mismatch: meta=%d file=%d", vm.Size, fi.Size())
+	}
+	if vm.SHA256 == "" {
+		// 兼容旧版元数据：无校验和时仅做尺寸校验。
+		return ""
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "data file unreadable: " + err.Error()
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "data file unreadable: " + err.Error()
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != vm.SHA256 {
+		return fmt.Sprintf("checksum mismatch: meta=%s file=%s", vm.SHA256, got)
+	}
+	return ""
 }

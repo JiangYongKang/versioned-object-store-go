@@ -11,10 +11,13 @@ import (
 	"testing"
 )
 
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+}
+
 func reopen(t *testing.T, dir string) *Store {
 	t.Helper()
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	s, err := Open(Config{Dir: dir, Logger: log})
+	s, err := Open(Config{Dir: dir, Logger: testLogger()})
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -117,8 +120,10 @@ func TestRecoveryRemovesCrashResidue(t *testing.T) {
 	}
 }
 
-// 元数据引用了缺失数据文件时，恢复须移除该悬挂版本条目而非留下坏引用。
-func TestRecoveryDropsVersionWithMissingData(t *testing.T) {
+// 元数据引用的版本数据文件丢失属于真实损坏：打开必须失败并给出
+// 可区分错误，指出具体键与版本；不得静默抹除版本或回退到更旧版本；
+// 反复重启结论保持一致。
+func TestRecoveryFailsOnMissingVersionData(t *testing.T) {
 	dir := t.TempDir()
 	s := reopen(t, dir)
 	v1 := putString(t, s, "k", "v1", PutOptions{})
@@ -132,20 +137,24 @@ func TestRecoveryDropsVersionWithMissingData(t *testing.T) {
 	if err := os.Remove(matches[0]); err != nil {
 		t.Fatalf("remove data file: %v", err)
 	}
-	s = reopen(t, dir)
-	vs, err := s.ListVersions("k")
-	if err != nil {
-		t.Fatalf("list: %v", err)
+	// 反复重开：每次都必须以相同的损坏结论失败。
+	for i := 0; i < 3; i++ {
+		_, err := Open(Config{Dir: dir, Logger: testLogger()})
+		var ce *CorruptionError
+		if !errors.As(err, &ce) || !errors.Is(err, ErrCorruption) {
+			t.Fatalf("reopen %d: err = %v, want CorruptionError", i, err)
+		}
+		if len(ce.Versions) != 1 || ce.Versions[0].Key != "k" || ce.Versions[0].VersionID != v1.VersionID {
+			t.Fatalf("reopen %d: corrupt versions = %+v, want k@%s", i, ce.Versions, v1.VersionID)
+		}
 	}
-	if len(vs) != 1 || vs[0].VersionID != v2.VersionID {
-		t.Fatalf("versions = %+v, want only %s", vs, v2.VersionID)
+	// 损坏现场未被改动：完好的 v2 数据文件仍在，元数据未被改写。
+	if _, err := os.Stat(filepath.Join(dir, "meta.json")); err != nil {
+		t.Fatalf("meta.json must remain: %v", err)
 	}
-	r, _, err := s.Get("k")
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	if got := getString(t, r); got != "v2" {
-		t.Fatalf("content = %q, want %q", got, "v2")
+	matches, _ = filepath.Glob(filepath.Join(dir, "data", "*", v2.VersionID))
+	if len(matches) != 1 {
+		t.Fatalf("intact version %s data must remain on disk", v2.VersionID)
 	}
 }
 
